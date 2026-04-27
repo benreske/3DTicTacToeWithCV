@@ -8,18 +8,20 @@ Model download (run once, then place next to game.py):
     curl -o hand_landmarker.task \
       https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task
  
+To learn what the hand library does: https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarker      
+
 Controls:
     SPACE  - Start game / restart
     ESC    - Quit
  
 Game Flow per turn:
-  1. Ready Check   → Thumbs Up to proceed
-  2. Level Select  → Raise 1, 2, or 3 fingers
-  3. Level Confirm → Thumbs Up to confirm  |  Cross arms to redo
-  4. Grid Select   → Hover thumb over cell, Pinch to choose
-  5. Grid Confirm  → Thumbs Up to place mark
+  1. Ready Check   -> Thumbs Up to proceed
+  2. Level Select  -> Raise 1, 2, or 3 fingers
+  3. Level Confirm -> Thumbs Up to confirm  |  Cross arms to redo
+  4. Grid Select   -> Hover thumb over cell, Pinch to choose
+  5. Grid Confirm  -> Thumbs Up to place mark
 """
- 
+
 import cv2
 import numpy as np
 import mediapipe as mp
@@ -29,6 +31,7 @@ import time
 import os
 import sys
 import serial
+import math
  
 # ─────────────────────────────────────────────────────────────
 # CONSTANTS
@@ -51,20 +54,17 @@ C_WIN       = (30, 220, 130)
  
 # Gesture sustain thresholds (frames at ~30 fps)
 SUSTAIN = {
-    "thumbs_up":     35, #Time to reset
-    "pinch":          40,  
-    "finger_count":  40,   
-    "forearm_cross": 40, 
+    "thumbs_up":     20, #Time to reset
+    "pinch":          30,  
+    "finger_count":  30,   
+    "forefinger_cross": 20, 
 }
  
 PHASE_LABELS = {
     0: "START",
-    1: "READY CHECK",
-    2: "LEVEL SELECT",
-    3: "LEVEL CONFIRM",
-    4: "GRID SELECT",
-    5: "PLACE CONFIRM",
-    6: "GAME OVER",
+    1: "LEVEL SELECT",
+    2: "GRID SELECT",
+    3: "GAME OVER",
 }
  
  
@@ -104,6 +104,22 @@ class Game:
                 if all(g[lv][r][c] == player for r in range(3)): return True
             if all(g[lv][i][i]   == player for i in range(3)):   return True
             if all(g[lv][i][2-i] == player for i in range(3)):   return True
+        # ── within a single x-plane ────────────────────────────
+        for r in range(3):
+            for lv in range(3):
+                if all(g[lv][r][c] == player for c in range(3)): return True
+            for c in range(3):
+                if all(g[lv][r][c] == player for lv in range(3)): return True
+            if all(g[i][r][i]   == player for i in range(3)):   return True
+            if all(g[i][r][2-i] == player for i in range(3)):   return True
+        # ── within a single y-plane ────────────────────────────
+        for c in range(3):
+            for r in range(3):
+                if all(g[lv][r][c] == player for lv in range(3)): return True
+            for lv in range(3):
+                if all(g[lv][r][c] == player for r in range(3)): return True
+            if all(g[i][i][c]   == player for i in range(3)):   return True
+            if all(g[i][2-i][c] == player for i in range(3)):   return True
         # ── verticals through levels ────────────────────────
         for r in range(3):
             for c in range(3):
@@ -157,11 +173,20 @@ class SustainTracker:
 class HandDetector:
     # Landmark indices
     WRIST      =  0
-    THUMB_IP   =  3; THUMB_TIP  =  4
-    INDEX_PIP  =  6; INDEX_TIP  =  8
-    MIDDLE_PIP = 10; MIDDLE_TIP = 12
-    RING_PIP   = 14; RING_TIP   = 16
-    PINKY_PIP  = 18; PINKY_TIP  = 20
+    THUMB_CMC   =  1; THUMB_MCP  =  2; THUMB_IP   =  3; THUMB_TIP  =  4
+    INDEX_PIP  =  6; INDEX_DIP  =  7; INDEX_TIP  =  8
+    MIDDLE_PIP = 10; MIDDLE_DIP = 11; MIDDLE_TIP = 12
+    RING_PIP   = 14; RING_DIP   = 15; RING_TIP   = 16
+    PINKY_PIP  = 18; PINKY_DIP  = 19; PINKY_TIP  = 20
+
+    ALL_POINTS = [
+        WRIST,
+        THUMB_CMC, THUMB_MCP, THUMB_IP, THUMB_TIP,
+        INDEX_PIP, INDEX_DIP, INDEX_TIP,
+        MIDDLE_PIP, MIDDLE_DIP, MIDDLE_TIP,
+        RING_PIP, RING_DIP, RING_TIP,
+        PINKY_PIP, PINKY_DIP, PINKY_TIP
+    ]
  
     def __init__(self, model_path):
         options = mp_vision.HandLandmarkerOptions(
@@ -185,25 +210,128 @@ class HandDetector:
     @staticmethod
     def _up(hand, tip, pip):
         return hand[tip].y < hand[pip].y
+    
+    @staticmethod
+    def _mean_and_std_y(hand, point_list):
+        mean_total = 0
+        for point in point_list:
+            mean_total += hand[point].y
+        mean = mean_total / len(point_list)
+
+        std_total = 0
+        for point in point_list:
+            std_total += (hand[point].y - mean) ** 2
+        std_total /= len(point_list) - 1
+        std = std_total ** 0.5
+        return [mean, std]
+    
+    @staticmethod
+    def _std_from_mean_y(hand, given_point, point_list):
+        mean_total = 0
+        for point in point_list:
+            mean_total += hand[point].y
+        mean = mean_total / len(point_list)
+
+        std_total = 0
+        for point in point_list:
+            std_total += (hand[point].y - mean) ** 2
+        std_total /= len(point_list) - 1
+        std = std_total ** 0.5
+
+        return (hand[given_point].y - mean) / std
+    
+    @staticmethod
+    def _vertical(hand, point1, point2, err_rad=0.3):
+        if hand[point2].x - hand[point1].x == 0:
+            return True
+        return abs(abs(math.atan((hand[point2].y - hand[point1].y) / (hand[point2].x - hand[point1].x))) - math.pi / 2) < err_rad
+    
+    @staticmethod
+    def _collinear(hand, point1, point2, point3, err_rad=0.7):
+        dx1 = hand[point2].x - hand[point1].x
+        dx2 = hand[point3].x - hand[point2].x
+        dy1 = hand[point2].y - hand[point1].y
+        dy2 = hand[point3].y - hand[point2].y
+
+        if dx1 == 0:
+            dx1 = 0.01
+        
+        if dx2 == 0:
+            dx2 = 0.01
+        
+        angle1 = math.atan(dy1 / dx1)
+        if dx1 < 0:
+            angle1 += math.pi
+        
+        angle2 = math.atan(dy2 / dx2)
+        if dx2 < 0:
+            angle2 += math.pi
+        
+        diff = angle2 - angle1
+
+        while diff > math.pi:
+            diff -= math.pi
+        while diff < -math.pi:
+            diff += math.pi
+        
+        return abs(diff) < err_rad
+    
+    @staticmethod
+    def _normed_angle(hand, point1, point2):
+        dx = hand[point2].x - hand[point1].x
+        dy = hand[point2].y - hand[point1].y
+
+        if dx == 0:
+            dx = 0.01
+        
+        angle = math.atan(dy / dx)
+        if dx < 0:
+            angle += math.pi
+
+        while angle > math.pi:
+            angle -= math.pi
+        
+        return angle
  
-    def is_thumbs_up(self, hand):
+    def is_thumbs_up(self, hand, std_err=0.4):
         h = hand
         return (
-            h[self.THUMB_TIP].y  < h[self.THUMB_IP].y  and
-            h[self.INDEX_TIP].y  > h[self.INDEX_PIP].y  and
-            h[self.MIDDLE_TIP].y > h[self.MIDDLE_PIP].y and
-            h[self.RING_TIP].y   > h[self.RING_PIP].y   and
-            h[self.PINKY_TIP].y  > h[self.PINKY_PIP].y
+            self._vertical(h, self.THUMB_CMC, self.THUMB_MCP) and
+            self._vertical(h, self.THUMB_MCP, self.THUMB_IP) and
+            self._vertical(h, self.THUMB_IP, self.THUMB_TIP) and
+            self._std_from_mean_y(hand, self.THUMB_TIP, self.ALL_POINTS) < std_err
         )
  
     def count_fingers(self, hand):
         h = hand
+        min_std_off = 0.5
+
         count = 0
-        if h[self.THUMB_TIP].y  < h[self.THUMB_IP].y:   count += 1
-        if h[self.INDEX_TIP].y  < h[self.INDEX_PIP].y:  count += 1
-        if h[self.MIDDLE_TIP].y < h[self.MIDDLE_PIP].y: count += 1
-        if h[self.RING_TIP].y   < h[self.RING_PIP].y:   count += 1
-        if h[self.PINKY_TIP].y  < h[self.PINKY_PIP].y:  count += 1
+        # if (self._collinear(h, self.THUMB_MCP, self.THUMB_IP, self.THUMB_TIP) and
+        #     self._std_from_mean_y(h, self.THUMB_TIP, self.ALL_POINTS) < -min_std_off): count += 1
+        # if (self._collinear(h, self.INDEX_DIP, self.INDEX_PIP, self.INDEX_TIP) and
+        #     self._std_from_mean_y(h, self.INDEX_TIP, self.ALL_POINTS) < -min_std_off): count += 1
+        # if (self._collinear(h, self.MIDDLE_DIP, self.MIDDLE_PIP, self.MIDDLE_TIP) and
+        #     self._std_from_mean_y(h, self.MIDDLE_TIP, self.ALL_POINTS) < -min_std_off): count += 1
+        # if (self._collinear(h, self.RING_DIP, self.RING_PIP, self.RING_TIP) and
+        #     self._std_from_mean_y(h, self.RING_TIP, self.ALL_POINTS) < -min_std_off): count += 1
+        # if (self._collinear(h, self.PINKY_DIP, self.PINKY_PIP, self.PINKY_TIP) and
+        #     self._std_from_mean_y(h, self.PINKY_TIP, self.ALL_POINTS) < -min_std_off): count += 1
+        if (self._vertical(h, self.THUMB_MCP, self.THUMB_IP) and
+            self._vertical(h, self.THUMB_IP, self.THUMB_TIP) and
+            self._std_from_mean_y(h, self.THUMB_TIP, self.ALL_POINTS) < -min_std_off): count += 1
+        if (self._vertical(h, self.INDEX_DIP, self.INDEX_PIP) and
+            self._vertical(h, self.INDEX_PIP, self.INDEX_TIP) and
+            self._std_from_mean_y(h, self.INDEX_TIP, self.ALL_POINTS) < -min_std_off): count += 1
+        if (self._vertical(h, self.MIDDLE_DIP, self.MIDDLE_PIP) and
+            self._vertical(h, self.MIDDLE_PIP, self.MIDDLE_TIP) and
+            self._std_from_mean_y(h, self.MIDDLE_TIP, self.ALL_POINTS) < -min_std_off): count += 1
+        if (self._vertical(h, self.RING_DIP, self.RING_PIP) and
+            self._vertical(h, self.RING_PIP, self.RING_TIP) and
+            self._std_from_mean_y(h, self.RING_TIP, self.ALL_POINTS) < -min_std_off): count += 1
+        if (self._vertical(h, self.PINKY_DIP, self.PINKY_PIP) and
+            self._vertical(h, self.PINKY_PIP, self.PINKY_TIP) and
+            self._std_from_mean_y(h, self.PINKY_TIP, self.ALL_POINTS) < -min_std_off): count += 1
         return count
  
     def is_pinch(self, hand, fw, fh, threshold=45):
@@ -216,18 +344,15 @@ class HandDetector:
     def thumb_px(self, hand, fw, fh):
         return int(hand[self.THUMB_TIP].x * fw), int(hand[self.THUMB_TIP].y * fh)
  
-    def are_fingers_crossed(self, result, fw):
-        """Detect crossed index fingers: both index tips close together."""
+    def are_fingers_crossed(self, result, dist_err=0.1):
         if len(result.hand_landmarks) < 2:
             return False
         h0 = result.hand_landmarks[0]
         h1 = result.hand_landmarks[1]
-        ix0 = h0[self.INDEX_TIP].x * fw
-        iy0 = h0[self.INDEX_TIP].y
-        ix1 = h1[self.INDEX_TIP].x * fw
-        iy1 = h1[self.INDEX_TIP].y
-        dist = ((ix0 - ix1)**2 + ((iy0 - iy1) * 720)**2) ** 0.5
-        return dist < 60
+
+        dist = ((h1[self.INDEX_DIP].x - h0[self.INDEX_DIP].x) ** 2 + (h1[self.INDEX_DIP].y - h0[self.INDEX_DIP].y) ** 2) ** 0.5
+
+        return dist < dist_err
  
  
 # ─────────────────────────────────────────────────────────────
@@ -263,6 +388,9 @@ class UI:
                 cv2.line(frame, pts[a], pts[b], C_ACCENT, 1, cv2.LINE_AA)
             for p in pts:
                 cv2.circle(frame, p, 3, C_TEXT, -1)
+            for i in range(len(pts)):
+                if HandDetector._std_from_mean_y(hand, i, HandDetector.ALL_POINTS) < -0.5:
+                    cv2.circle(frame, pts[i], 10, C_TEXT, -1)
  
     def hud(self, frame, game, phase, frac=0.0, msg="", warn=""):
         pcolor = C_P1 if game.current_player == 1 else C_P2
@@ -399,7 +527,15 @@ def main():
         sys.exit(1)
  
     cap = cv2.VideoCapture(0)
-    ser = serial.Serial('COM3', 115200)
+
+    # Setting up Arduino
+    if sys.platform == "win32":  # We are on Windows
+        ser = serial.Serial('COM3', 115200)
+    elif sys.platform == "darwin":  # We are on Mac
+        ser = serial.Serial('/dev/cu.usbserial-0001', 115200)
+    else:  # What are we on?
+        print("ERROR: Figure out the name of the Arduino on your device")
+
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  WIN_W)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, WIN_H)
  
@@ -436,7 +572,8 @@ def main():
  
         key = cv2.waitKey(1) & 0xFF
         if key == 27: break
-        if key == 32 and phase in (0, 6):
+        if key == 32 and phase in (0, 4):
+            ser.write(bytes([1]))
             game.reset(); go(1)
  
         # ── detect ───────────────────────────────────────────
@@ -455,23 +592,13 @@ def main():
         if phase == 0:
             ui.start_menu(frame)
  
-        # ── 1: Ready check ───────────────────────────────────
-        elif phase == 1:
-            thu  = has_hand and detector.is_thumbs_up(hand0)
-            frac = sustain.get("thumbs_up") / SUSTAIN["thumbs_up"]
-            ui.hud(frame, game, phase, min(frac,1),
-                   f"Player {game.current_player} - Thumbs Up when ready!", warn_msg)
-            ui.all_levels(frame, game)
-            ui.legend(frame, phase)
-            if has_hand: ui.draw_skeleton(frame, result)
-            if sustain.fired("thumbs_up", thu, SUSTAIN["thumbs_up"]):
-                go(2)
- 
         # ── 2: Level selection ───────────────────────────────
-        elif phase == 2:
+        elif phase == 1:
             fc    = detector.count_fingers(hand0) if has_hand else 0
+            fc_frac = sustain.get("finger_count") / SUSTAIN["finger_count"]
+
             valid = has_hand and 1 <= fc <= 3
-            frac  = sustain.get("finger_count") / SUSTAIN["finger_count"]
+            frac  = fc_frac
             sub   = f"Fingers detected: {fc}" if has_hand else "No hand visible"
             ui.hud(frame, game, phase, min(frac,1),
                    f"Player {game.current_player} - Raise 1, 2 or 3 fingers", sub)
@@ -481,34 +608,18 @@ def main():
             if sustain.fired("finger_count", valid, SUSTAIN["finger_count"]):
                 if 1 <= fc <= 3:
                     level_candidate = fc
-                    go(3)
+                    lv_idx = level_candidate - 1
+                    if game.is_level_full(lv_idx):
+                        set_warn(f"Level {level_candidate} is full! Pick another.")
+                        sustain.reset_all()
+                    else:
+                        game.current_level = lv_idx
+                        go(2)
                 else:
                     set_warn("Show exactly 1, 2 or 3 fingers!")
  
-        # ── 3: Level confirmation ────────────────────────────
-        elif phase == 3:
-            lv_idx = level_candidate - 1
-            if game.is_level_full(lv_idx):
-                set_warn(f"Level {level_candidate} is full! Pick another.")
-                go(2)
-            else:
-                thu  = has_hand and detector.is_thumbs_up(hand0)
-                crs  = detector.are_fingers_crossed(result, fw)
-                ft   = sustain.get("thumbs_up")    / SUSTAIN["thumbs_up"]
-                fc2  = sustain.get("forearm_cross") / SUSTAIN["forearm_cross"]
-                frac = max(ft, fc2)
-                ui.hud(frame, game, phase, min(frac,1),
-                       f"Level {level_candidate} — Thumbs Up (GOOD) | Cross forefingers (RESELECT)", warn_msg)
-                ui.all_levels(frame, game, active_lv=lv_idx)
-                ui.legend(frame, phase)
-                if has_hand: ui.draw_skeleton(frame, result)
-                if sustain.fired("thumbs_up", thu, SUSTAIN["thumbs_up"]):
-                    game.current_level = lv_idx; go(4)
-                elif sustain.fired("forearm_cross", crs, SUSTAIN["forearm_cross"]):
-                    go(2)
- 
         # ── 4: Grid selection (thumb hover + pinch) ──────────
-        elif phase == 4:
+        elif phase == 2:
             lv = game.current_level
             grid_geom = ui.big_grid(frame, game, lv,
                                     hover=game.hover_pos, pending=game.pending_pos)
@@ -522,23 +633,28 @@ def main():
                     cell_rc = None
                 game.hover_pos = cell_rc
  
-                pinched = detector.is_pinch(hand0, fw, fh)
-                valid_p = pinched and game.hover_pos is not None
-                fp      = sustain.get("pinch") / SUSTAIN["pinch"]
-                ui.hud(frame, game, phase, min(fp,1),
-                       f"Player {game.current_player} - Hover thumb - Pinch to select", warn_msg)
+                pinched     = detector.is_pinch(hand0, fw, fh)
+                valid_p     = pinched and game.hover_pos is not None
+                valid_cross = detector.are_fingers_crossed(result)
+                fp          = sustain.get("pinch") / SUSTAIN["pinch"]
+                cross_frac  = sustain.get("forefinger_cross") / SUSTAIN["forefinger_cross"]
+                frac = max(fp, cross_frac)
+                ui.hud(frame, game, phase, min(frac,1),
+                       f"Player {game.current_player} - Hover thumb - Pinch to select. Cross forefingers to go back", warn_msg)
                 ui.draw_skeleton(frame, result)
                 # draw thumb cursor dot
                 cv2.circle(frame, (tx, ty), 10, C_ACCENT, 2, cv2.LINE_AA)
                 if sustain.fired("pinch", valid_p, SUSTAIN["pinch"]):
                     if game.hover_pos:
-                        game.pending_pos = game.hover_pos; go(5)
+                        game.pending_pos = game.hover_pos; go(3)
                     else:
                         set_warn("Point thumb at an empty cell first!")
+                elif sustain.fired("forefinger_cross", valid_cross, SUSTAIN["forefinger_cross"]):
+                    go(1)
             else:
                 game.hover_pos = None
                 ui.hud(frame, game, phase, 0,
-                       f"Player {game.current_player} - Hover thumb - Pinch to select",
+                       f"Player {game.current_player} - Hover thumb - Pinch to select. Cross forefingers to go back",
                        "No hand detected")
  
             ui.all_levels(frame, game, active_lv=lv,
@@ -546,14 +662,19 @@ def main():
             ui.legend(frame, phase)
  
         # ── 5: Place confirmation (thumbs-up) ────────────────
-        elif phase == 5:
+        elif phase == 3:
             lv      = game.current_level
             pr, pc2 = game.pending_pos
             if grid_geom:
                 ui.big_grid(frame, game, lv, pending=game.pending_pos)
  
             thu  = has_hand and detector.is_thumbs_up(hand0)
-            frac = sustain.get("thumbs_up") / SUSTAIN["thumbs_up"]
+            thu_frac = sustain.get("thumbs_up") / SUSTAIN["thumbs_up"]
+            
+            valid_cross = detector.are_fingers_crossed(result)
+            cross_frac  = sustain.get("forefinger_cross") / SUSTAIN["forefinger_cross"]
+            frac = max(thu_frac, cross_frac)
+            
             ui.hud(frame, game, phase, min(frac,1),
                    f"Place at row {pr+1}, col {pc2+1}? Thumbs Up ✓", warn_msg)
             ui.all_levels(frame, game, active_lv=lv, pending=game.pending_pos)
@@ -563,26 +684,28 @@ def main():
             if sustain.fired("thumbs_up", thu, SUSTAIN["thumbs_up"]):
                 if game.make_move(lv, pr, pc2):
                     flat = [game.grid[lv][r][c] for lv in range(3) for r in range(3) for c in range(3)]
-                    ser.write(bytes(flat))
+                    ser.write(bytes([0] + [lv, pr, pc2] + flat))
                     game.hover_pos = game.pending_pos = None
                     if game.check_win(game.current_player):
                         game.game_over = True
                         game.winner    = game.current_player
-                        go(6)
+                        go(4)
                     elif game.is_board_full():
                         game.game_over = True
                         game.winner    = 0
-                        go(6)
+                        go(4)
                     else:
                         game.current_level = None
                         game.switch_player()
                         go(1)
                 else:
                     set_warn("Cell already taken! Reselect.")
-                    go(4)
+                    go(2)
+            elif sustain.fired("forefinger_cross", valid_cross, SUSTAIN["forefinger_cross"]):
+                go(2)
  
         # ── 6: Game over ─────────────────────────────────────
-        elif phase == 6:
+        elif phase == 4:
             ui.all_levels(frame, game)
             ui.game_over(frame, game)
  
