@@ -66,6 +66,9 @@ PHASE_LABELS = {
     2: "GRID SELECT",
     3: "GAME OVER",
 }
+
+BOARD_SIZE = 3
+OPTION_CAP = BOARD_SIZE + 1
  
  
 # ─────────────────────────────────────────────────────────────
@@ -614,6 +617,7 @@ def main():
                         sustain.reset_all()
                     else:
                         game.current_level = lv_idx
+                        ser.write(bytes([2, lv_idx]))
                         go(2)
                 else:
                     set_warn("Show exactly 1, 2 or 3 fingers!")
@@ -646,10 +650,13 @@ def main():
                 cv2.circle(frame, (tx, ty), 10, C_ACCENT, 2, cv2.LINE_AA)
                 if sustain.fired("pinch", valid_p, SUSTAIN["pinch"]):
                     if game.hover_pos:
-                        game.pending_pos = game.hover_pos; go(3)
+                        game.pending_pos = game.hover_pos
+                        ser.write(bytes([3, game.current_level, game.pending_pos[0], game.pending_pos[1]]))
+                        go(3)
                     else:
                         set_warn("Point thumb at an empty cell first!")
                 elif sustain.fired("forefinger_cross", valid_cross, SUSTAIN["forefinger_cross"]):
+                    ser.write(bytes([2, OPTION_CAP, OPTION_CAP, OPTION_CAP]))
                     go(1)
             else:
                 game.hover_pos = None
@@ -700,8 +707,10 @@ def main():
                         go(1)
                 else:
                     set_warn("Cell already taken! Reselect.")
+                    ser.write(bytes([3, OPTION_CAP]))
                     go(2)
             elif sustain.fired("forefinger_cross", valid_cross, SUSTAIN["forefinger_cross"]):
+                ser.write(bytes([3, OPTION_CAP]))
                 go(2)
  
         # ── 6: Game over ─────────────────────────────────────
